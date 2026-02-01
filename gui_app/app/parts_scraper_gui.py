@@ -12,7 +12,9 @@ import time
 import os
 import sys
 from helpers import Helper
-from batch_watermark_detector import BatchWatermarkDetector
+from s3_service import S3Service, S3DeleteHandler
+from batch_watermark_detector import OpenAIBatchClient
+from openai import OpenAI
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -51,11 +53,13 @@ class PartsScraperGUI:
         # Setup GUI
         self.create_widgets()
 
-        self.db = Database()
-        self.detector = BatchWatermarkDetector(self.db, self.open_ai_key)
-        self.helper = Helper(self.db, self.detector)
-        self.state = StateDB()
-
+        # ── wiring ──────────────────────────────────────────
+        self.db             = Database()
+        self.s3             = S3Service(bucket=self.bucket)
+        self.delete_handler = S3DeleteHandler()
+        openai_client       = OpenAIBatchClient(OpenAI(api_key=self.open_ai_key))
+        self.helper         = Helper(self.db, self.s3, openai_client)
+        self.state          = StateDB()
 
         self.determine_state()
 
@@ -67,11 +71,21 @@ class PartsScraperGUI:
         self.log_message("Performing AI watermark detection")
         self.ai_watermark_btn.configure(state=tk.DISABLED)
 
+        # 1. submit all batches
         ids = self.helper.organize_and_submit_batch()
         self.log_message("Data has been sent to AI - waiting for response")
         self.state.set(batch_ids=ids)
+
+        # 2. poll until every batch is terminal
         self.poll_open_ai()
-        self.db.send_delete_request_watermark()
+
+        # 3. parse results → accumulate delete keys
+        results = self.helper.parse_ai_results(ids)
+        for result in results:
+            self.delete_handler.handle(result)
+
+        # 4. flush: delete from S3 + clean up DB
+        self.delete_handler.execute(self.db, self.s3)
 
         self.progress_bar.stop()
         self.log_message("Ready for last step Filter Images")
@@ -79,12 +93,11 @@ class PartsScraperGUI:
 
 
     def poll_open_ai(self):
-        current = self.state.read()
+        current   = self.state.read()
         batch_ids = current.get("batch_ids")
 
         completed = False
-        count = 0
-        all_results = []
+        count     = 0
         time.sleep(40)
 
         while not completed:
@@ -93,19 +106,22 @@ class PartsScraperGUI:
             self.clear_log()
             self.log_message("Data has been sent to AI - Could take anywhere from 5 minutes to 12 hours to process")
             self.log_message(f"minutes: {count}")
+
+            all_terminal = True
             for batch_id in batch_ids:
-                result, status = self.detector.poll_multiple_batch_completion(batch_id)
+                is_terminal, status = self.helper.poll_batch(batch_id)
                 self.log_message(f"{batch_id} : {status}")
-                all_results.append(result)
-            if all(all_results):
+                if not is_terminal:
+                    all_terminal = False
+
+            if all_terminal:
                 completed = True
-            all_results = []
+
             self.log_message('\n')
         
         self.log_message("AI has determined which images have watermarks and they are being deleted...")
-
-        self.helper.parse_ai_results(batch_ids)
         self.state.set(image_watermark_detection=True)
+
     def perform_filter(self): # this is process
         self.progress_bar.start(30)
         self.filter_images_btn.configure(state=tk.DISABLED)
@@ -146,7 +162,7 @@ class PartsScraperGUI:
         time.sleep(70)
         while not all_terminated:
             time.sleep(60)
-            all_terminated,state = self.helper.determine_instance_state()
+            all_terminated, state = self.helper.determine_instance_state()
             count += 1
             self.clear_log()
             self.log_message("Program will be complete after processing...")
@@ -154,8 +170,9 @@ class PartsScraperGUI:
         
         end = time.time()
         print(f"Elapsed Time for filter : {end - start}")
-        # Deletes the CSV files from search_jobs
-        self.db.empty_prefix(self.bucket, self.process_job_key)
+
+        # Deletes the CSV files from process jobs
+        self.s3.empty_prefix(self.process_job_key)
 
         self.clear_log()
         self.log_message("All images have been processed")
@@ -164,7 +181,7 @@ class PartsScraperGUI:
 
         # self.db.update_all_final_tags() handling this in image process class
         self.db.execute_sql("DELETE FROM part_tags;")
-        self.db.empty_prefix(self.bucket, 'images')
+        self.s3.empty_prefix('images')
         self.status_var.set("COMPLETED: Images are Ready for Deployment")
         self.state.set(image_watermark_detection=False)
 
@@ -193,7 +210,7 @@ class PartsScraperGUI:
         self.clear_log()
         self.state.set(image_search_state=False)
         
-        start = time.time()   #####################################
+        start = time.time()
         if self.testing:
             self.helper.send_chunk_messages(   
                 job_id = "Testing",           
@@ -217,7 +234,7 @@ class PartsScraperGUI:
         time.sleep(70)
         while not all_terminated:
             time.sleep(60)
-            all_terminated,state = self.helper.determine_instance_state()
+            all_terminated, state = self.helper.determine_instance_state()
             count += 1
             self.clear_log()
             self.log_message("Watermark Button will become clickable when all images have been downloaded...")
@@ -228,8 +245,9 @@ class PartsScraperGUI:
         end = time.time()
         self.state.set(image_search_state=True)
         print(f"Time Elapsed for image search: {end - start}")
-        # Deletes the CSV files from search_jobs
-        self.db.empty_prefix(self.bucket, self.search_job_key)
+
+        # Deletes the CSV files from search jobs
+        self.s3.empty_prefix(self.search_job_key)
 
         self.clear_log()
         self.log_message("All images have been downloaded.\nYou can now start the watermark")
@@ -325,11 +343,6 @@ class PartsScraperGUI:
 
 
         # Progress Bar
-        # self.progress_var = tk.DoubleVar()
-        # self.progress_bar = ttk.Progressbar(main_frame, variable=self.progress_var, 
-        #                                    maximum=100, length=400)
-        # self.progress_bar.grid(row=7, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
-
         self.progress_bar = ttk.Progressbar(main_frame, mode=['indeterminate'], 
                                            length=400)
         self.progress_bar.grid(row=7, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
@@ -488,7 +501,6 @@ class PartsScraperGUI:
             self.processing = True
             self.toggle_controls(False)
             self.stop_btn.config(state=tk.NORMAL)
-            #self.progress_var.set(0)
 
 
             # Start processing thread
