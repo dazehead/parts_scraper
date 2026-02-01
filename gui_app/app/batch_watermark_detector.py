@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Protocol, runtime_checkable
 
 from openai import OpenAI
 
+from scraper_app.app.scraper.database import Database
+
 
 # ──────────────────────────────────────────────────────────────
 # 1.  Data types  (plain, shared across the pipeline)
@@ -586,8 +588,6 @@ def build_pipeline(db, openai_api_key: str | None = None) -> BatchWatermarkPipel
 if __name__ == "__main__":
     # `db` is whatever object your project already passes around.
     # Replace with your real DB connection.
-    # db = ...
-
-    # pipeline = build_pipeline(db)
-    # summary  = pipeline.execute()
-    print("Import build_pipeline and call pipeline.execute() to run.")
+    db = Database()
+    pipeline = build_pipeline(db)
+    summary  = pipeline.execute()
