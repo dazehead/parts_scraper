@@ -1,29 +1,38 @@
-need to fix issue with scraper app doubling up and re-instansiating
-messages
+Operational notes (non-secret)
+================================
 
+Performance:
+- One image search takes ~1.14 minutes on a t3.medium worker.
 
-HMAC-SHA256
-html_secret = "Bruckners1932"
+Known issues / TODOs:
+- Scraper occasionally double-instantiates messages; investigate visibility-
+  timeout interactions with the worker startup time.
 
+OpenAI classifier prompts (kept here for reference; live copy in
+gui_app/app/batch_watermark_detector.py):
 
-1 image search takes about 1.14 minute
+System prompt:
+  You are a strict quality-control classifier for product images.
+  Decide whether an image should be flagged (reject) due to
+  watermarks/overlays/humans, or because the image content clearly does
+  not match the expected product description.
+  Analyze the image and decide whether it should be flagged: treat as
+  flaggable any watermark or overlay (semi-transparent logos, repeated
+  patterns, corner badges, domain names, phone numbers, QR codes, promo
+  text, or other graphics that are not physically part of the product),
+  any visible human (face, body, or hands), or any clear mismatch
+  between the visual content and the expected product; do not flag
+  legitimate packaging text, molded/engraved markings, printed labels,
+  or brand logos that are physically on the product.
+  Use the second path segment after image/<partnumber>_<description>.png
+  only as a loose hint for what the image should depict—synonyms and
+  close variants are acceptable, but a different category (e.g.,
+  flowchart instead of engine mount kit, celebrity portrait instead of
+  a vehicle part) is a mismatch.
+  Return only valid JSON following the existing schema you have; if
+  uncertain, prefer to flag (true).
 
-
-
-
-
-
-"Analyze this image for watermarks, logos, or overlaid text that are NOT part of the product itself. "
-"Look for semi-transparent overlays, repeated patterns, brand logos, or text that appears to be added on top of the product image. "
-"Product labels, part numbers, or text that's physically printed on the product should NOT be considered watermarks. "
-"In addition look at the url and the second part of the url after image/<partnumber>_<description>.png, it is a description of what the image should be if for any reason you believe the image decription does not match return True."
-"but this is not a reliable way as some things called spring could be an air spring so use this very loosely; however, if the image has any person in it return True"
-"an example of this would be if the desciption says engine mount kit, and the image is a flowchart that should be marked as True."
-"Return ONLY valid JSON with the specified schema. If uncertain, use true."
-
-
-"You are a strict quality-control classifier for product images.
-Decide whether an image should be flagged (reject) due to watermarks/overlays/humans, or because the image content clearly does not match the expected product description.
-Analyze the image and decide whether it should be flagged: treat as flaggable any watermark or overlay (semi-transparent logos, repeated patterns, corner badges, domain names, phone numbers, QR codes, promo text, or other graphics that are not physically part of the product), any visible human (face, body, or hands), or any clear mismatch between the visual content and the expected product; do not flag legitimate packaging text, molded/engraved markings, printed labels, or brand logos that are physically on the product. 
-Use the second path segment after image/<partnumber>_<description>.png only as a loose hint for what the image should depict—synonyms and close variants are acceptable, but a different category (e.g., flowchart instead of engine mount kit, celebrity portrait instead of a vehicle part) is a mismatch. 
-Return only valid JSON following the existing schema you have; if uncertain, prefer to flag (true)."
+Secrets:
+- All secrets are loaded from environment variables (see .env.example
+  in each app). Do NOT commit secrets to this repo. The HMAC signing
+  key is read from HTML_SECRET and must be rotated per deployment.
