@@ -4,36 +4,25 @@ from botocore.exceptions import NoCredentialsError
 from sqlalchemy import create_engine, text
 import pandas as pd
 from threading import Lock
+import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 from uuid import uuid4
 
-from tenancy.ids import validate_tenant_id
-from tenancy import attach_tenant_to_engine
-
 load_dotenv()
-
-
 class Database:
-    def __init__(self, tenant_id=None):
-        self.tenant_id = validate_tenant_id(tenant_id) if tenant_id else None
+    def __init__(self):
         self.user = os.getenv("DB_USER")
         self.password = os.getenv("DB_PASSWORD")
         self.host = os.getenv("DB_HOST")
         self.port = os.getenv("DB_PORT")
         self.db = 'parts_db'
         self.driver = "ODBC+Driver+18+for+SQL+Server"
-        self.engine = self.get_engine()
-        attach_tenant_to_engine(self.engine, self.tenant_id)
-        self.lock = Lock()
+        self.engine = self.get_engine() # Initialize engine in the constructor
+        self.lock = Lock() # Thread lock for database access
         self.s3 = boto3.client("s3")
         self.bucket = os.getenv("BUCKET")
         self.delete_keys = []
         self.to_delete_df = pd.DataFrame({"tag_value": pd.Series(dtype="string")})
-
-    def set_tenant(self, tenant_id):
-        self.tenant_id = validate_tenant_id(tenant_id)
-        attach_tenant_to_engine(self.engine, self.tenant_id)
-        return self.tenant_id
 
     def get_engine(self):
         url = (
@@ -45,19 +34,15 @@ class Database:
     def change_db(self, new_db):
         self.db = new_db
 
-    def execute_sql(self, sql_text, params=None):
+    def execute_sql(self, sql_text):
         "Executes any SQL in the statement"
         with self.lock, self.engine.begin() as conn:
-            return conn.execute(text(sql_text), params or {})
-
-    def read_sql_query(self, sql_text, params=None):
-        """Execute a SQL query and return the result as a pandas DataFrame.
-
-        Pass user-supplied values via ``params`` (a dict of bound parameters)
-        rather than f-string interpolation, to avoid SQL injection.
-        """
+            return conn.execute(text(sql_text))
+             
+    def read_sql_query(self, sql_text):
+        """Execute a SQL query and return the result as a pandas DataFrame."""
         with self.lock, self.engine.begin() as conn:
-            return pd.read_sql_query(text(sql_text), conn, params=params or {})
+            return pd.read_sql_query(text(sql_text), conn)
     
     def to_sql(self, df, table_name, if_exists='append', index=False, schema=None):
         """Write records stored in a DataFrame to a SQL database."""
@@ -105,52 +90,29 @@ class Database:
         except Exception as e:
             print(f"Error occurred while creating table {table_name}: {e}")
 
-    def upsert_append_new_only(self, df, target="dbo.parts", key_col=("tenant_id", "number")):
-        """Bulk load df, MERGE into target, insert only new rows.
-
-        ``key_col`` may be a single column name or a tuple of names;
-        the match predicate ANDs them. For the multi-tenant schema:
-
-        * ``dbo.parts``      → ``("tenant_id", "number")``
-        * ``dbo.part_tags``  → ``("tenant_id", "tag_value")``
-
-        We refuse to upsert when this Database has a ``tenant_id`` but
-        the DataFrame doesn't carry a ``tenant_id`` column. If the
-        DataFrame carries the column with a value that differs from
-        the current tenant we also refuse — both are signals of a
-        programming error producing cross-tenant rows.
+    def upsert_append_new_only(self, df, target="dbo.parts", key_col="number"):
+        """
+        Bulk load df into a throwaway staging table, MERGE into target,
+        insert only rows whose key_col doesn't exist yet, then DROP the stage.
         """
         if df.empty:
             return 0
-
-        if self.tenant_id:
-            if "tenant_id" not in df.columns:
-                df = df.assign(tenant_id=self.tenant_id)
-            else:
-                bad = df[df["tenant_id"] != self.tenant_id]
-                if not bad.empty:
-                    raise ValueError(
-                        f"refusing upsert: {len(bad)} rows have tenant_id != "
-                        f"{self.tenant_id!r}"
-                    )
-
-        match_cols = (key_col,) if isinstance(key_col, str) else tuple(key_col)
 
         schema, tgt_name = target.split('.', 1)
         stage_name = f"{tgt_name}_stage_{uuid4().hex[:8]}"
         stage_full = f"{schema}.{stage_name}"
 
+        # Adjust these to your actual column list
         cols = list(df.columns)
         col_csv = ", ".join(f"[{c}]" for c in cols)
         src_cols_csv = ", ".join(f"src.[{c}]" for c in cols)
-        on_predicate = " AND ".join(
-            f"tgt.[{c}] = src.[{c}]" for c in match_cols
-        )
 
         try:
             with self.lock, self.engine.begin() as conn:
+                # 1) Create an empty stage with same shape as target
                 conn.execute(text(f"SELECT TOP 0 * INTO {stage_full} FROM {target};"))
 
+                # 2) Bulk into stage
                 df.to_sql(
                     name=stage_name,
                     con=conn,
@@ -158,18 +120,20 @@ class Database:
                     if_exists='append',
                     index=False,
                     method='multi',
-                    chunksize=1000,
+                    chunksize=1000,  # keep params under SQL Server limits
                 )
 
+                # 3) MERGE: insert only not-yet-existing keys
                 conn.execute(text(f"""
                     MERGE {target} AS tgt
                     USING (SELECT DISTINCT {col_csv} FROM {stage_full}) AS src
-                    ON {on_predicate}
+                    ON tgt.[{key_col}] = src.[{key_col}]
                     WHEN NOT MATCHED BY TARGET THEN
                     INSERT ({col_csv}) VALUES ({src_cols_csv});
                 """))
 
         finally:
+            # 4) Always drop the stage, even if an error occurred above
             with self.engine.begin() as conn:
                 conn.execute(text(f"IF OBJECT_ID('{stage_full}', 'U') IS NOT NULL DROP TABLE {stage_full};"))
 
@@ -229,43 +193,35 @@ class Database:
             self.delete_keys.append({'Key': f'images/{key}'})
         
     def send_delete_request_watermark(self):
-        """Delete flagged keys from S3 and the matching rows from part_tags.
-
-        Tenant-scoped when this Database has a tenant_id, so a watermark
-        stage run by tenant A cannot wipe tenant B's part_tags.
-        """
+        """"Deletes from s3 and also deletes from parts_tags database
+        data insdie self.delete_keys needs to be self.delete_keys.append({'Key': f'images/{key}'})"""
+        # limits to 1000 keys
         def _chunk_list(data, limit=900):
             for i in range(0, len(data), limit):
                 yield data[i:i + limit]
+                
 
         base_url = f"https://{self.bucket}.s3.us-east-1.amazonaws.com/"
         for chunk in _chunk_list(self.delete_keys):
-            deletion_request = {'Objects': chunk, 'Quiet': True}
-            self.s3.delete_objects(Bucket=self.bucket, Delete=deletion_request)
+            deletion_request = {'Objects': chunk,
+                                'Quiet': True}
+            self.s3.delete_objects(
+                Bucket = self.bucket,
+                Delete= deletion_request
+            )
+                   # format and get ready for deletion from database
             temp_delete = [f"{base_url}{obj['Key']}" for obj in chunk]
             df_urls = pd.DataFrame({"tag_value": temp_delete})
             self.to_delete_df = pd.concat([self.to_delete_df, df_urls], ignore_index=True)
 
         self.create_table_if_not_exists("to_delete", self.to_delete_df)
         self.to_sql(self.to_delete_df, 'to_delete', schema='dbo')
-        if self.tenant_id:
-            self.execute_sql(
-                """
-                DELETE pt
-                FROM dbo.part_tags AS pt
-                INNER JOIN to_delete AS td
-                    ON td.tag_value = pt.tag_value
-                WHERE pt.tenant_id = :tenant_id;
-                """,
-                params={"tenant_id": self.tenant_id},
-            )
-        else:
-            self.execute_sql("""
-                DELETE pt
-                FROM dbo.part_tags AS pt
-                INNER JOIN to_delete AS td
-                    ON td.tag_value = pt.tag_value;
-                """)
+        self.execute_sql("""
+            DELETE pt
+            FROM dbo.part_tags AS pt
+            INNER JOIN to_delete AS td
+                ON td.tag_value = pt.tag_value;
+            """)
         self.execute_sql("DROP TABLE to_delete;")
     
     def empty_prefix(self, bucket_name, prefix):
@@ -313,4 +269,4 @@ class Database:
 
 if __name__ == "__main__":
     db = Database()
-    print(db.empty_prefix(os.environ["BUCKET"], 'images'))
+    print(db.empty_prefix('partsbucket0000', 'images'))

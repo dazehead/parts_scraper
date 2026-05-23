@@ -4,32 +4,21 @@ from botocore.exceptions import NoCredentialsError
 from sqlalchemy import create_engine, text
 import pandas as pd
 from threading import Lock
+import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 from uuid import uuid4
 
-from tenancy.ids import validate_tenant_id
-from tenancy import attach_tenant_to_engine
-
 load_dotenv()
-
-
 class Database:
-    def __init__(self, tenant_id=None):
-        self.tenant_id = validate_tenant_id(tenant_id) if tenant_id else None
-
+    def __init__(self):
         self.user = os.getenv("DB_USER")
         self.password = os.getenv("DB_PASSWORD")
         self.host = os.getenv("DB_HOST")
         self.port = os.getenv("DB_PORT")
         self.db = 'parts_db'
         self.driver = "ODBC+Driver+18+for+SQL+Server"
-        self.engine = self.get_engine()
-        # Set SESSION_CONTEXT('tenant_id') on every checked-out
-        # connection so SQL Server's row-level-security policy
-        # (migration 003) sees the right tenant. No-op when tenant_id
-        # is None.
-        attach_tenant_to_engine(self.engine, self.tenant_id)
-        self.lock = Lock()
+        self.engine = self.get_engine() # Initialize engine in the constructor
+        self.lock = Lock() # Thread lock for database access
         self.s3 = boto3.client("s3")
         self.bucket = os.getenv("BUCKET")
         self.delete_keys = []
@@ -44,18 +33,14 @@ class Database:
     def change_db(self, new_db):
         self.db = new_db
 
-    def execute_sql(self, sql_text, params=None):
+    def execute_sql(self, sql_text):
         with self.lock, self.engine.begin() as conn:
-            return conn.execute(text(sql_text), params or {})
-
-    def read_sql_query(self, sql_text, params=None):
-        """Execute a SQL query and return the result as a pandas DataFrame.
-
-        Pass user-supplied values via ``params`` (a dict of bound parameters)
-        rather than f-string interpolation, to avoid SQL injection.
-        """
+            return conn.execute(text(sql_text))
+             
+    def read_sql_query(self, sql_text):
+        """Execute a SQL query and return the result as a pandas DataFrame."""
         with self.lock, self.engine.begin() as conn:
-            return pd.read_sql_query(text(sql_text), conn, params=params or {})
+            return pd.read_sql_query(text(sql_text), conn)
     
     def to_sql(self, df, table_name, if_exists='append', index=False, schema=None):
         """Write records stored in a DataFrame to a SQL database."""
@@ -220,49 +205,28 @@ class Database:
         return total_deleted
 
     def upsert_append_new_only(self, df, target="dbo.parts", key_col="number"):
-        """Bulk load df, MERGE into target on tenant-aware match keys.
-
-        ``key_col`` may be a single column name or a tuple of column
-        names; the MERGE condition ANDs them. The tenant-aware match
-        keys for the two tables we care about:
-
-        * ``dbo.parts``      → ``("tenant_id", "number")``
-        * ``dbo.part_tags``  → ``("tenant_id", "tag_value")``
-
-        We refuse to upsert if ``self.tenant_id`` is set but the
-        DataFrame doesn't carry a ``tenant_id`` column — that would be
-        a programmer error producing cross-tenant rows.
+        """
+        Bulk load df into a throwaway staging table, MERGE into target,
+        insert only rows whose key_col doesn't exist yet, then DROP the stage.
         """
         if df.empty:
             return 0
-
-        if self.tenant_id and "tenant_id" not in df.columns:
-            raise ValueError(
-                "Database constructed with tenant_id but DataFrame has no "
-                "tenant_id column; refusing to write to avoid cross-tenant rows"
-            )
-
-        # Accept legacy single-string ``key_col`` for backward compat.
-        if isinstance(key_col, str):
-            match_cols = (key_col,)
-        else:
-            match_cols = tuple(key_col)
 
         schema, tgt_name = target.split('.', 1)
         stage_name = f"{tgt_name}_stage_{uuid4().hex[:8]}"
         stage_full = f"{schema}.{stage_name}"
 
+        # Adjust these to your actual column list
         cols = list(df.columns)
         col_csv = ", ".join(f"[{c}]" for c in cols)
         src_cols_csv = ", ".join(f"src.[{c}]" for c in cols)
-        on_predicate = " AND ".join(
-            f"tgt.[{c}] = src.[{c}]" for c in match_cols
-        )
 
         try:
             with self.lock, self.engine.begin() as conn:
+                # 1) Create an empty stage with same shape as target
                 conn.execute(text(f"SELECT TOP 0 * INTO {stage_full} FROM {target};"))
 
+                # 2) Bulk into stage
                 df.to_sql(
                     name=stage_name,
                     con=conn,
@@ -270,18 +234,20 @@ class Database:
                     if_exists='append',
                     index=False,
                     method='multi',
-                    chunksize=1000,
+                    chunksize=1000,  # keep params under SQL Server limits
                 )
 
+                # 3) MERGE: insert only not-yet-existing keys
                 conn.execute(text(f"""
                     MERGE {target} AS tgt
                     USING (SELECT DISTINCT {col_csv} FROM {stage_full}) AS src
-                    ON {on_predicate}
+                    ON tgt.[{key_col}] = src.[{key_col}]
                     WHEN NOT MATCHED BY TARGET THEN
                     INSERT ({col_csv}) VALUES ({src_cols_csv});
                 """))
 
         finally:
+            # 4) Always drop the stage, even if an error occurred above
             with self.engine.begin() as conn:
                 conn.execute(text(f"IF OBJECT_ID('{stage_full}', 'U') IS NOT NULL DROP TABLE {stage_full};"))
 

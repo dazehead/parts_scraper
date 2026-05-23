@@ -1,45 +1,30 @@
-import os, re
+import os, sys, re
+import matplotlib.pyplot as plt
 from collections import defaultdict
 import numpy as np
 from skimage.io import imread
 from skimage.transform import resize
+from skimage.metrics import structural_similarity as ssim
 from skimage import img_as_float
 from skimage.color import rgb2gray
-from PIL import Image
+from pathlib import Path
+import pandas as pd
+from PIL import Image 
 import hmac, hashlib, base64
 import io
 from dotenv import load_dotenv
-
-from obs import get_logger
-from obs.metrics import build_emitter
-from tenancy import TenantPaths
-from tenancy.ids import validate_tenant_id
-
 load_dotenv()
-
-_log = get_logger("image_proc.processing")
-_metrics = build_emitter(stage="image_proc")
 
 
 class Img_Proc:
-    def __init__(self, db, tenant_id=None, testing=False):
+    def __init__(self,db, testing=False):
         self.testing = testing
         self.folder = "images"
         self.db = db
-        # tenant_id may be None for tests / dry runs, but every write
-        # path validates it before touching S3 or SQL.
-        self.tenant_id = validate_tenant_id(tenant_id) if tenant_id else None
-        self.paths = TenantPaths(self.tenant_id) if self.tenant_id else None
-
         self.bucket = os.getenv("BUCKET")
         self.prefix = os.getenv('IMAGE_KEY')
         self.html_secret = os.getenv('HTML_SECRET')
-        if not self.bucket:
-            raise RuntimeError("BUCKET environment variable is required")
-        if not self.html_secret:
-            raise RuntimeError("HTML_SECRET environment variable is required")
-        self.region = os.getenv("AWS_REGION", "us-east-1")
-        self.final_url = f"https://{self.bucket}.s3.{self.region}.amazonaws.com/"
+        self.final_url = "https://partsbucket0000.s3.us-east-1.amazonaws.com/"
 
 
     def group_images(self):
@@ -48,6 +33,26 @@ class Img_Proc:
         for name in self.images:
             base_name = '_'.join(name.split('_')[:-1])  # strip the numeric suffix
             self.grouped[base_name].append(name)
+
+    # ---------- Display helpers ----------
+    # def show_image(self, img, title="Image", cmap=None):
+    #     plt.figure()
+    #     plt.imshow(img, cmap=cmap)
+    #     plt.title(title)
+    #     plt.axis('off')
+    #     plt.tight_layout()
+    #     plt.show()
+
+    # def show_images_side_by_side(self, img1, img2, title1="Image 1", title2="Image 2", cmap=None):
+    #     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    #     axes[0].imshow(img1, cmap=cmap)
+    #     axes[0].set_title(title1)
+    #     axes[0].axis('off')
+    #     axes[1].imshow(img2, cmap=cmap)
+    #     axes[1].set_title(title2)
+    #     axes[1].axis('off')
+    #     plt.tight_layout()
+    #     plt.show()
 
     # ---------- Image IO / preprocessing ----------
 
@@ -65,6 +70,38 @@ class Img_Proc:
         img = resize(img, size, anti_aliasing=True)
         return img
 
+    # def load_and_resize_cv(self, path, where='(unknown)', size=(600,600)):
+    #     """
+    #     Load an image from `path` with OpenCV, resize to `size` (w,h),
+    #     return float32 in [0,1]. Handles gray/RGB/RGBA.
+    #     """
+    #     p = Path(path)
+    #     if not p.exists():
+    #         raise FileNotFoundError(f"{where}: file not found -> {p}")
+
+    #     # Read image (preserves alpha if present)
+    #     img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+    #     if img is None:
+    #         raise IOError(f"{where}: could not read {p}")
+
+    #     # Drop alpha channel if present
+    #     if img.ndim == 3 and img.shape[2] == 4:
+    #         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+    #     # Accept 2-D (grayscale) or 3-D (color) only
+    #     if img.ndim not in (2, 3):
+    #         raise ValueError(f"{where}: expected 2-D or 3-D, got {img.shape}")
+
+    #     # Resize to fixed dimensions (OpenCV expects size=(w,h))
+    #     img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+
+    #     img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    #     # # Convert to float32 [0,1] (matches img_as_float behaviour)
+    #     # img = img.astype(np.float32) / 255.0
+
+    #     return img
+
     def to_grayscale(self,img, where="(unknown)"):
         """Convert an image to grayscale float32 2D array."""
         if img.ndim == 3:
@@ -81,6 +118,40 @@ class Img_Proc:
             img = np.ascontiguousarray(img, dtype=np.float32)
 
         return img
+
+
+    def to_gray2d_uint8(self, img):
+        """Return a 2D grayscale uint8 image from BGR/BGRA/GRAY or float."""
+        if img is None:
+            raise ValueError("to_gray2d_uint8: got None")
+        arr = img
+
+        # dtype → uint8
+        if np.issubdtype(arr.dtype, np.floating):
+            arr = (np.clip(arr, 0, 1) * 255.0).round().astype(np.uint8) if arr.max() <= 1.0 else np.clip(arr, 0, 255).astype(np.uint8)
+        elif arr.dtype != np.uint8:
+            if np.issubdtype(arr.dtype, np.integer):
+                arr = (arr.astype(np.float32) * (255.0 / np.iinfo(arr.dtype).max)).round().astype(np.uint8)
+            else:
+                arr = arr.astype(np.uint8)
+
+        # channels → 1
+        if arr.ndim == 2:
+            gray = arr
+        elif arr.ndim == 3:
+            c = arr.shape[2]
+            if c == 3:
+                gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+            elif c == 4:
+                gray = cv2.cvtColor(arr, cv2.COLOR_BGRA2GRAY)
+            else:
+                # collapse odd channel counts
+                gray = np.mean(arr, axis=2).round().astype(np.uint8)
+        else:
+            arr = np.squeeze(arr)
+            gray = arr if arr.ndim == 2 else arr[..., 0].astype(np.uint8)
+
+        return gray
 
 
     def resize_image(self, img, shape=(16, 16)):
@@ -216,6 +287,21 @@ class Img_Proc:
                 entries.append((path, h))
 
 
+                # if testing and tracker == 0:
+                #     # self.show_images_side_by_side(small, oriented,
+                #     #     title1=f"{fn} (16×16)", title2=f"{fn} ({desc})", cmap='gray')
+                #     self.show_pipeline_with_hash(
+                #         orig = imread(path),
+                #         gray=gray,
+                #         small16=oriented,
+                #         hash_int=h,
+                #         method=method,
+                #         hash_size=hash_size,
+                #         title=os.path.basename(path)
+                #     )
+                #     tracker += 1
+
+
             except Exception as e:
                 print(f"  [skip] {path}: {e}")
 
@@ -245,48 +331,118 @@ class Img_Proc:
                                         distance_thresh=distance_thresh, testing=self.testing)
 
 
+ # --------------- used with testing to show how images are processed -----------------
+    def _int_to_bits(self, value: int, h: int, w: int) -> np.ndarray:
+        """Inverse of _bits_to_int: unpack to (h, w) row-major boolean array."""
+        nbits = h * w
+        s = bin(value)[2:].zfill(nbits)  # MSB on the left
+        arr = np.frombuffer(s.encode('ascii'), dtype='S1').astype(np.uint8) - ord('0')
+        return arr.reshape(h, w).astype(bool)
+
+    # def show_pipeline_with_hash(
+    #     self,
+    #     orig: np.ndarray,
+    #     gray: np.ndarray,
+    #     small16: np.ndarray,
+    #     hash_int: int,
+    #     method: str = "phash",
+    #     hash_size: int = 8,
+    #     title: str | None = None,
+    #     savepath: str | None = None,
+    # ):
+    #     """
+    #     Display original, grayscale, 16x16, and a visual bit-grid of the hash.
+    #     Hash (hex) is printed on the figure as well.
+    #     """
+    #     # Prepare the hash grid (phash/ahash/dhash all use hash_size x hash_size bits here)
+    #     hbits = self._int_to_bits(hash_int, hash_size, hash_size).astype(np.float32)
+    #     # Make sure arrays are valid for imshow
+    #     def _to_float01(img):
+    #         if img.dtype == np.uint8:
+    #             return img / 255.0
+    #         return np.clip(img.astype(np.float32), 0.0, 1.0)
+
+    #     orig_v = _to_float01(orig)
+    #     gray_v = _to_float01(gray)
+    #     small_v = _to_float01(small16)
+
+    #     fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+
+    #     # Original (RGB or gray)
+    #     if orig_v.ndim == 3:
+    #         axes[0, 0].imshow(orig_v)
+    #     else:
+    #         axes[0, 0].imshow(orig_v, cmap='gray')
+    #     axes[0, 0].set_title("Original")
+    #     axes[0, 0].axis('off')
+
+    #     # Grayscale
+    #     axes[0, 1].imshow(gray_v, cmap='gray')
+    #     axes[0, 1].set_title("Grayscale")
+    #     axes[0, 1].axis('off')
+
+    #     # 16x16 (pixelated so you can see cells)
+    #     axes[1, 0].imshow(small_v, cmap='gray', interpolation='nearest')
+    #     axes[1, 0].set_title("Resized 16×16")
+    #     axes[1, 0].axis('off')
+
+    #     # Hash bit grid: white=1, black=0
+    #     axes[1, 1].imshow(hbits, cmap='gray', interpolation='nearest')
+    #     axes[1, 1].set_title(f"{method} bit grid ({hash_size}×{hash_size})")
+    #     axes[1, 1].axis('off')
+
+    #     # Compose hex string (pad to full length)
+    #     hex_len = (hash_size * hash_size + 3) // 4
+    #     hex_str = f"0x{hash_int:0{hex_len}X}"
+
+    #     # Put hash on the layout: suptitle + annotation on the hash cell
+    #     if title:
+    #         fig.suptitle(title, fontsize=12)
+    #     fig.text(0.5, 0.02, f"{method} = {hex_str}", ha='center', va='bottom', fontsize=11)
+
+    #     # Also overlay a small label inside the hash cell
+    #     axes[1, 1].text(
+    #         0.5, -0.08, hex_str,
+    #         ha='center', va='top', transform=axes[1, 1].transAxes, fontsize=9
+    #     )
+
+    #     plt.tight_layout(rect=[0, 0.04, 1, 0.96])
+    #     if savepath:
+    #         plt.savefig(savepath, dpi=150, bbox_inches='tight')
+    #     plt.show()
+
+
     def retrieve_from_s3_and_run(self, grouped):
         """download from s3 puts them in images folder then processes them for similarities"""
         grouped_strings = ['/'.join(x.split('/')[-2:]) for x in grouped]
 
         display_string = grouped_strings[0].split('/')[1:][0]
         display_string = ' '.join(display_string.split('_')[:-1])
+        print(f'--New Group--->> {display_string}')
 
         self.group_map = self.db.download_group(self.bucket, grouped_strings)
 
-        keep = self.try_mulitiple_hashes(grouped_strings)
-        keep = [keep[0]]  # only grabs the first one to keep
 
-        if len(keep[0]) == 18:
+        keep =  self.try_mulitiple_hashes(grouped_strings)
+        keep = [keep[0]] # only grabs the first one to keep
+
+        if len(keep[0]) ==18:
             keep = [self.group_map[keep[0]]]
 
+ 
         self.db.save_data_for_deletion_img_proc(grouped_strings, keep)
 
-        # Metric: dedup discarded (group_size - 1) candidates per part.
-        discarded = max(0, len(grouped_strings) - 1)
-        _metrics.count("ImagesDiscardedByDedup", discarded)
-        _metrics.count("ImagesKept", 1)
-        _log.info(
-            "group reduced",
-            group=display_string,
-            candidates=len(grouped_strings),
-            discarded=discarded,
-            kept=1,
-        )
 
-        img = self.grab_image_and_implement_watermark(keep, False)
+
+        img= self.grab_image_and_implement_watermark(keep, False)
         hash_key = self.hash_key(keep, self.html_secret)
+        print(hash_key)
 
         pil = self.to_pil(img)
         buf = io.BytesIO()
         pil.save(buf, format='PNG', optimize=True)
         buf.seek(0)
-
-        # Tenant-scope the destination key. hash_key already starts with
-        # "final/"; when running in a tenant context we promote that
-        # under tenants/<tenant_id>/.
-        if self.paths is not None:
-            hash_key = self.paths.normalise(hash_key)
+        
 
         self.db.s3.put_object(
             Bucket=self.bucket,
@@ -298,38 +454,11 @@ class Img_Proc:
         s = keep[0]
         m = re.search(r'(?<=/)[^_]+(?=_)', s)
         number = m.group(0)
-        if self.tenant_id is not None:
-            self.db.execute_sql(
-                """
-                UPDATE dbo.parts
-                SET final_tag = :final_tag
-                WHERE tenant_id = :tenant_id AND [number] = :number;
-                """,
-                params={
-                    "final_tag": f"{self.final_url}{hash_key}",
-                    "tenant_id": self.tenant_id,
-                    "number": number,
-                },
-            )
-        else:
-            # Legacy / pre-cutover code paths only — should not run in production.
-            self.db.execute_sql(
-                """
-                UPDATE dbo.parts
-                SET final_tag = :final_tag
-                WHERE [number] = :number;
-                """,
-                params={
-                    "final_tag": f"{self.final_url}{hash_key}",
-                    "number": number,
-                },
-            )
-        _log.info(
-            "final tag written",
-            tenant_id=self.tenant_id,
-            part_number=number,
-            key=hash_key,
-        )
+        self.db.execute_sql(f"""
+        UPDATE dbo.parts
+        SET final_tag = '{self.final_url}{hash_key}'
+        WHERE [number] = '{number}';
+        """)
 
         self.db.empty_dir('images')
 
@@ -439,5 +568,10 @@ class Img_Proc:
         raise ValueError("unsupported image shape")
 
 if __name__ == "__main__":
-    img_proc = Img_Proc(db=None, testing=False)
-    img_proc.retrieve_from_s3_and_run(os.environ["BUCKET"])
+    img_proc = Img_Proc(testing = False)
+    # img_proc.run_hashing(
+    #         method= 'phash',
+    #         hash_size= 8,
+    #         distance_thresh= 12)
+
+    img_proc.retrieve_from_s3_and_run("partsbucket0000","images")

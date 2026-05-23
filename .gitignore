@@ -7,16 +7,3 @@ venv/
 __pycache__
 testbed.py
 AWS/*
-
-# Terraform
-**/.terraform/
-**/.terraform.lock.hcl
-*.tfstate
-*.tfstate.*
-*.tfvars
-crash.log
-crash.*.log
-
-# Test artefacts
-.pytest_cache/
-.coverage

@@ -9,24 +9,11 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ProxyError, ConnectTimeout, ReadTimeout, SSLError, RequestException
 
-from obs import get_logger
-from obs.metrics import build_emitter
-from tenancy import TenantPaths
-from tenancy.ids import validate_tenant_id
-
 pd.set_option("display.max_colwidth", None)
 load_dotenv()
 
-_log = get_logger("scraper.parser")
-_metrics = build_emitter(stage="scraper")
-
 class Parser:
-    def __init__(self, db, text, tenant_id):
-        # tenant_id is validated by the caller, but we re-validate here
-        # because Parser is small and gets called per-row.
-        self.tenant_id = validate_tenant_id(tenant_id)
-        self.paths = TenantPaths(self.tenant_id)
-
+    def __init__(self, db, text):
         username = os.getenv("DECODO_USERNAME")
         password = os.getenv("DECODO_PASSWORD")
         username = quote(username, safe='')
@@ -42,13 +29,9 @@ class Parser:
         }
         self.timeout = 5
 
-
+        
         self.db = db
         self.s3 = boto3.client("s3")
-        self.bucket = os.getenv("BUCKET")
-        self.region = os.getenv("AWS_REGION", "us-east-1")
-        if not self.bucket:
-            raise RuntimeError("BUCKET environment variable is required")
 
         self.links = []
         self.tor = None
@@ -91,63 +74,27 @@ class Parser:
         except (ProxyError, ConnectTimeout, ReadTimeout, SSLError) as e:
             print(f"[bing] proxy path failed: {e}; retrying direct...")
             resp = self._fetch(use_proxy=False)
-        except RequestException:
+        except RequestException as e:
             # Non-proxy fatal (e.g., 4xx other than 407) — rethrow so caller can DLQ
             raise
 
-        self.links = self._extract_links(resp.text)[:30]
-        return self.links
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-    def _extract_links(self, html):
-        """Parse Bing's image-search response and return ordered candidate URLs.
-
-        Bing has historically wrapped each result in <a class="iusc" m='{...}'>.
-        We keep that as the primary selector but fall back to any element
-        with an ``m`` attribute that JSON-decodes to a dict containing
-        ``murl``. As a last resort we regex over the raw HTML. Each fallback
-        is logged so a silent layout change is visible to the operator.
-        """
-        import re
-
-        soup = BeautifulSoup(html, "html.parser")
         links = []
-        seen = set()
-
-        def _consume(payload):
+        for a in soup.select("a.iusc"):
+            m = a.get("m")
+            if not m:
+                continue
             try:
-                data = json.loads(payload)
-            except (json.JSONDecodeError, TypeError):
-                return
-            url = data.get("murl") if isinstance(data, dict) else None
-            if url and url not in seen:
-                seen.add(url)
-                links.append(url)
-
-        # Primary: a.iusc[m]
-        for a in soup.select("a.iusc[m]"):
-            _consume(a.get("m"))
-
-        # Fallback 1: any element with an `m` attribute whose JSON has murl.
-        if not links:
-            for el in soup.find_all(attrs={"m": True}):
-                _consume(el.get("m"))
-            if links:
-                print("[bing] primary selector empty; matched via attribute fallback")
-
-        # Fallback 2: regex straight over the HTML.
-        if not links:
-            for match in re.finditer(r'"murl":"(https?:[^"\\]+)"', html):
-                url = match.group(1)
-                if url not in seen:
-                    seen.add(url)
+                data = json.loads(m)
+                url = data.get("murl")
+                if url:
                     links.append(url)
-            if links:
-                print("[bing] selector fallbacks empty; matched via regex fallback")
+            except json.JSONDecodeError:
+                continue
 
-        if not links:
-            print("[bing] WARNING: no candidate URLs found in response; HTML layout may have changed")
-
-        return links
+        self.links = links[:30]
+        return self.links
 
 
     def download_images(self, keep_bytes=True):
@@ -168,26 +115,16 @@ class Parser:
             info = self.query
             print(info)
             part_number = info.split(" ")[0]
-            part_id = self.db.read_sql_query(
-                "SELECT part_id FROM dbo.parts "
-                "WHERE tenant_id = :tenant_id AND number = :number",
-                params={"tenant_id": self.tenant_id, "number": part_number},
-            )
-            if part_id.empty:
-                _log.warning(
-                    "no part_id for query; skipping row",
-                    tenant_id=self.tenant_id,
-                    part_number=part_number,
-                )
-                return None, []
+            part_id = self.db.read_sql_query(f"SELECT part_id FROM parts WHERE number = '{part_number}'")
             part_id = int(part_id["part_id"].iat[0])
 
             while self.images_downloaded < self.max_images:
                 url = self.links.pop()
+                #tag = url.split('.')[-1]
                 file_name = info.replace(" ", "_") + "_" + str(self.images_downloaded) + ".png"
-                file_name = file_name.replace('/', "_")
-                file_name = file_name.replace(',', '')
-                s3_key = self.paths.image_key(file_name)
+                file_name = file_name.replace('/',"_")
+                file_name = file_name.replace(',','')
+                s3_key = f"images/{file_name}"
 
                 session.headers.update({
                     "User-Agent": (
@@ -212,34 +149,20 @@ class Parser:
                         buf.seek(0)
 
                         self.s3.put_object(
-                            Bucket=self.bucket,
+                            Bucket='partsbucket0000',
                             Key=s3_key,
                             Body=buf.getvalue(),
                             ContentType='image/png'
                         )
-                        _log.info(
-                            "image uploaded",
-                            tenant_id=self.tenant_id,
-                            part_number=part_number,
-                            s3_key=s3_key,
-                            bucket=self.bucket,
-                        )
-                        _metrics.count("ImagesDownloaded", Tenant=self.tenant_id)
+                        print(f'uploaded to s3://partsbucket0000/{s3_key}')
                         self.images_downloaded += 1
-
-
+   
+    
                 except Exception as e:
-                    _log.warning(
-                        "image fetch failed",
-                        tenant_id=self.tenant_id,
-                        part_number=part_number,
-                        url=url,
-                        error=str(e),
-                    )
-                    _metrics.count("ImageFetchErrors", Tenant=self.tenant_id)
+                    print('ERROR', e)
 
                 else:
-                    url_value = f"https://{self.bucket}.s3.{self.region}.amazonaws.com/{s3_key}"
+                    url_value = f"https://partsbucket0000.s3.us-east-1.amazonaws.com/{s3_key}"
                     tag_values.append(url_value)
 
         except Exception as e:
